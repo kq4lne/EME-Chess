@@ -129,6 +129,7 @@ FCC rules (Part 97.119) require your station to transmit its call sign at the en
 - Your opponent is responsible for identifying their own station under their own country's rules.
 
 ## Troubleshooting
+- Opponent's moves do not appear on the board: leave "Show every decode from WSJT-X in the log" ticked and watch the log. A line starting "RX" appears for every message WSJT-X decodes. The "UDP from WSJT-X" counter under the status shows whether decodes are reaching this program at all. If the counter rises but no move appears, the log line shows exactly what text arrived.
 - Still "not connected": WSJT-X must be running, and the three Reporting settings above must match exactly (127.0.0.1, 2237, Accept UDP requests).
 - Error box about the UDP port: another program (JTAlert, GridTracker and similar) is already using port 2237. Close it while playing.
 - Nothing is transmitted: press Enable Tx in WSJT-X, and check the mode, frequency and Tx even/1st settings.
@@ -153,9 +154,10 @@ MSG_FREE_TEXT = 9
 #   C007 E2E4 D?    a move with a draw offer attached
 #   C008 DRAW.      accept a draw offer (sent instead of a move)
 #   C008 RESIGN     resign (sent instead of a move)
-# A trailing "?" from a low-confidence decode is tolerated.
-MOVE_RE = re.compile(r"^C(\d{3}) (X?)([A-H][1-8][A-H][1-8][QRBN]?)( D\?)?\??$")
-CMD_RE = re.compile(r"^C(\d{3}) (RESIGN|DRAW\.)\??$")
+# Matching is tolerant: extra text after the message (a trailing "?" or a
+# decoder annotation such as "q3") is ignored.
+MOVE_RE = re.compile(r"\bC(\d{3}) (X?)([A-H][1-8][A-H][1-8][QRBN]?)( D\?)?")
+CMD_RE = re.compile(r"\bC(\d{3}) (RESIGN|DRAW\.)")
 
 
 def _utf8(text):
@@ -191,6 +193,10 @@ class WsjtxLink:
         self.inbox = inbox
         self.addr = None            # where WSJT-X is (learned from its packets)
         self.client_id = "WSJT-X"
+        self.n_packets = 0
+        self.n_decodes = 0
+        self.last_decode = None
+        self._seen_errors = set()
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((UDP_IP, UDP_PORT))
@@ -203,11 +209,13 @@ class WsjtxLink:
                 data, addr = self.sock.recvfrom(65535)
             except OSError:
                 break
+            mtype = None
             try:
                 r = Reader(data)
                 magic, _schema, mtype = r.take(">III")
                 if magic != MAGIC:
                     continue
+                self.n_packets += 1
                 self.client_id = r.utf8() or self.client_id
                 self.addr = addr
                 if not announced:
@@ -221,8 +229,9 @@ class WsjtxLink:
                     r.take(">I")            # delta frequency
                     r.utf8()                # mode character
                     message = r.utf8()
-                    if is_new:
-                        self.inbox.put(("decode", snr, message))
+                    self.n_decodes += 1
+                    self.last_decode = time.time()
+                    self.inbox.put(("decode", snr, message))
                 elif mtype == MSG_STATUS:
                     r.take(">Q")            # dial frequency
                     r.utf8()                # mode
@@ -251,8 +260,13 @@ class WsjtxLink:
                         pass
                     self.inbox.put(("status", tx_enabled, transmitting,
                                     de_call, dx_call, tx_message))
-            except Exception:
-                continue                    # ignore anything we can't parse
+            except Exception as err:
+                key = (mtype, type(err).__name__)
+                if key not in self._seen_errors:     # report each kind once
+                    self._seen_errors.add(key)
+                    self.inbox.put(("error", f"Could not parse a WSJT-X packet "
+                                             f"(type {mtype}): {err!r}"))
+                continue
 
     @property
     def connected(self):
@@ -340,7 +354,10 @@ class ChessApp:
                                      anchor="w", wraplength=330, justify="left")
         self.status_label.pack(fill="x", pady=6)
         self.id_label = tk.Label(panel, text="", font=("Segoe UI", 9), anchor="w")
-        self.id_label.pack(fill="x", pady=(0, 6))
+        self.id_label.pack(fill="x", pady=(0, 2))
+        self.udp_label = tk.Label(panel, text="UDP from WSJT-X: waiting...",
+                                  font=("Segoe UI", 8), fg=MUTED, anchor="w")
+        self.udp_label.pack(fill="x", pady=(0, 6))
 
         self.confirm_btn = tk.Button(panel, text="Confirm && Send".replace("&&", "&"),
                                      command=self.confirm, state="disabled",
@@ -386,6 +403,11 @@ class ChessApp:
                                    insertbackground=FG, relief="flat")
         self.test_entry.pack(side="left", padx=4)
         tk.Button(test, text="Go", command=self.test_receive).pack(side="left")
+        self.show_all = tk.BooleanVar(value=True)
+        tk.Checkbutton(panel, text="Show every decode from WSJT-X in the log",
+                       variable=self.show_all, selectcolor=INPUT_BG,
+                       activebackground=BG, activeforeground=FG,
+                       anchor="w").pack(fill="x", pady=(4, 0))
 
         if os.path.exists(SAVE_FILE):
             self.load()
@@ -406,6 +428,10 @@ class ChessApp:
         self.log_box.insert("end", f"{stamp}  {text}\n")
         self.log_box.see("end")
         self.log_box.config(state="disabled")
+
+    def dbg(self, text):
+        if self.show_all.get():
+            self.log(text)
 
     def refresh(self):
         self.draw()
@@ -632,33 +658,47 @@ class ChessApp:
     def poll(self):
         try:
             while True:
-                item = self.inbox.get_nowait()
-                if item[0] == "connected":
-                    self.conn_label.config(text=f"WSJT-X: connected ({item[1]})",
-                                           fg=GOOD)
-                elif item[0] == "decode":
-                    self.handle_message(item[2], item[1])
-                elif item[0] == "status":
-                    self.on_status(*item[1:])
-        except queue.Empty:
-            pass
-        self.root.after(200, self.poll)
+                try:
+                    item = self.inbox.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self.dispatch(item)
+                except Exception as err:
+                    self.log(f"Internal error handling '{item[0]}': {err!r}")
+        finally:
+            self.root.after(200, self.poll)
+
+    def dispatch(self, item):
+        kind = item[0]
+        if kind == "connected":
+            self.conn_label.config(text=f"WSJT-X: connected ({item[1]})", fg=GOOD)
+        elif kind == "decode":
+            snr, text = item[1], item[2]
+            if self.show_all.get():
+                self.log(f"RX {snr:+d} dB: {text!r}")
+            self.handle_message(text, snr)
+        elif kind == "status":
+            self.on_status(*item[1:])
+        elif kind == "error":
+            self.log(item[1])
 
     def test_receive(self):
         self.handle_message(self.test_entry.get(), 0)
 
     def handle_message(self, text, snr):
-        clean = text.strip().upper()
+        clean = " ".join(text.strip().upper().split())
         if self.ended:
             return
         ply = len(self.board.move_stack)
         opp_turn = self.board.turn != self.my_color     # we are waiting on them
 
         # --- resign / accept draw (take the place of the opponent's move) ---
-        c = CMD_RE.match(clean)
+        c = CMD_RE.search(clean)
         if c:
             seq, word = int(c.group(1)), c.group(2)
             if not opp_turn or seq <= ply:
+                self.dbg(f"Heard '{clean}' but ignored it (not expected now).")
                 return
             if seq != ply + 1:
                 self.log(f"OUT OF SYNC: got #{seq}, expected #{ply + 1}.")
@@ -675,7 +715,7 @@ class ChessApp:
             return
 
         # --- ordinary move ---
-        m = MOVE_RE.match(clean)
+        m = MOVE_RE.search(clean)
         if not m:
             return                                  # not a chess message
         seq, declined = int(m.group(1)), bool(m.group(2))
@@ -690,9 +730,11 @@ class ChessApp:
                 self.log("Opponent OFFERS A DRAW.")
                 self.save()
                 self.refresh()
+            self.dbg(f"Heard '{clean}' but ignored it (it is your turn).")
             return
         if seq <= ply:
-            return                                  # our own echo / duplicate
+            self.dbg(f"Heard '{clean}' - already played / our own echo, ignored.")
+            return
         if seq != ply + 1:
             self.log(f"OUT OF SYNC: got move #{seq}, expected #{ply + 1}. "
                      "Ask opponent to re-send.")
@@ -840,7 +882,22 @@ class ChessApp:
             self.log("Tx was switched off but you have transmitted since your "
                      "last ID. When you are finished, press 'Final ID (73)'.")
 
+    def update_udp_label(self):
+        link = self.link
+        last = (time.strftime("%H:%M:%S", time.localtime(link.last_decode))
+                if link.last_decode else "never")
+        self.udp_label.config(text=f"UDP from WSJT-X: {link.n_packets} packets, "
+                                   f"{link.n_decodes} decodes (last {last})")
+
     def id_tick(self):
+        try:
+            self._id_tick()
+        except Exception as err:
+            self.log(f"Internal error in ID timer: {err!r}")
+            self.root.after(1000, self.id_tick)
+
+    def _id_tick(self):
+        self.update_udp_label()
         self.maybe_queue_id()
         now = time.time()
         colour = FG
